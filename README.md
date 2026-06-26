@@ -98,6 +98,5 @@ A typical end-to-end bring-up:
 
 ## Secrets
 
-`vllm-deploy-master/vars.yml` is gitignored — it holds the Hugging Face token and
-the vLLM API key. Use `vars.example.yml` as the template, and consider
+Use `vars.example.yml` as the template, and consider
 `ansible-vault encrypt vars.yml` for shared environments.
