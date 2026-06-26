@@ -9,19 +9,19 @@ The stack is split in two layers, each in its own directory:
 
 ```
 ┌─────────────────────────────────────────────┐
-│  hermes-base/         (web UI + agent)       │
-│  ─────────────                               │
-│  Multi-agent web interface that talks to     │
-│  any OpenAI-compatible endpoint.             │
+│  hermes-base/         (web UI + agent)      │
+│  ─────────────                              │
+│  Multi-agent web interface that talks to    │
+│  any OpenAI-compatible endpoint.            │
 └─────────────────────────────────────────────┘
                      │
                      │  HTTP (OpenAI-compatible /v1)
                      ▼
 ┌─────────────────────────────────────────────┐
-│  vllm-deploy-master/  (inference server)     │
-│  ────────────────────                        │
-│  Ansible playbook deploying Qwen3.6 35B      │
-│  A3B FP8 on vLLM with optimised flags.       │
+│  vllm-deploy-master/  (inference server)    │
+│  ────────────────────                       │
+│  Ansible playbook deploying Qwen3.6 35B     │
+│  A3B FP8 on vLLM with optimised flags.      │
 └─────────────────────────────────────────────┘
 ```
 
