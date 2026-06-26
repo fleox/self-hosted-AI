@@ -1,0 +1,3 @@
+.env
+/hermes_home
+**/node_modules

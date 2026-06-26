@@ -1,0 +1,5 @@
+# macOS
+.DS_Store
+
+# Ansible secrets
+vllm-deploy-master/vars.yml

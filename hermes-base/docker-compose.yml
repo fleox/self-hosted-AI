@@ -1,0 +1,26 @@
+services:
+  hermes-tech:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ${PROJECT_NAME}_webui
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./hermes_home:/home/hermeswebui/.hermes
+      #- ./hermes_workspace:/workspace
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.${PROJECT_NAME}.rule=Host(`${APP_FQDN}`)"
+      - "traefik.http.routers.${PROJECT_NAME}.entrypoints=${TRAEFIK_ENTRYPOINT:-http}"
+      - "traefik.http.services.${PROJECT_NAME}.loadbalancer.server.port=8787"
+      - "traefik.docker.network=${TRAEFIK_NETWORK:-traefik}"
+    networks:
+      - traefik
+    ports:
+      - 8642:8642
+
+networks:
+  traefik:
+    external: true
+    name: ${TRAEFIK_NETWORK:-traefik}

@@ -1,0 +1,434 @@
+---
+# =============================================================================
+#  Deploy Qwen3.6 35B A3B FP8 — OpenAI-compatible endpoint via vLLM
+#  Target: Ubuntu 22.04 / 24.04 / 26.04 with NVIDIA GPU
+#
+#  Usage:
+#    ansible-playbook -i inventory.ini deploy-gemma-vllm.yml \
+#        -e @vars.yml --ask-become-pass
+#
+#  Idempotent: safe to re-run at any time (config re-rendered + service restarted).
+# =============================================================================
+
+- name: Deploy Qwen3.6 35B A3B FP8 (vLLM, OpenAI-compatible)
+  hosts: gemma_servers
+  become: true
+  gather_facts: true
+
+  # ---------------------------------------------------------------------------
+  #  DEFAULT VARIABLES  (override via -e @vars.yml or group_vars/)
+  # ---------------------------------------------------------------------------
+  vars:
+    # --- Secrets (provide via vars.yml or Ansible Vault) ----------------------
+    hf_token: ""                               # leave empty for public models; HF read token otherwise
+    vllm_api_key: "CHANGE_ME_api_key"          # key required by API clients
+
+    # --- Model ----------------------------------------------------------------
+    model_repo: "Qwen/Qwen3.6-35B-A3B-FP8"    # HF repo (MoE, already quantized FP8)
+    served_model_name: "qwen3.6-35b-a3b"       # name exposed through the API
+    vllm_image: "vllm/vllm-openai:latest"
+
+    # --- Sizing / performance -------------------------------------------------
+    max_model_len: 131072                      # 128K context window
+    gpu_memory_utilization: 0.90
+    kv_cache_dtype: "fp8"
+    max_num_seqs: 32
+    vllm_quantization: ""                      # model already FP8 — no --quantization flag
+    disable_request_logging: false             # true → --disable-log-requests (GDPR)
+
+    # --- Qwen3 — tool calling / reasoning -------------------------------------
+    tool_call_parser: "qwen3_xml"
+    reasoning_parser: "qwen3"
+    enable_thinking: true
+    thinking_budget: 1024
+
+    # --- MTP speculative decoding ---------------------------------------------
+    speculative_num_tokens: 2                  # draft tokens per step (method "mtp")
+
+    # --- Mamba / SSM (hybrid SSM layers in Qwen3-MoE) ------------------------
+    mamba_cache_dtype: "float16"
+    mamba_ssm_cache_dtype: "float16"
+    mamba_cache_mode: "align"
+
+    # --- Prefill backend ------------------------------------------------------
+    gdn_prefill_backend: "triton"
+
+    # --- Network / exposure ---------------------------------------------------
+    vllm_port: 8000
+    vllm_bind_host: "0.0.0.0"
+    manage_firewall: true
+    ssh_port: 22                               # adjust if SSH runs on a custom port
+    api_allowed_cidrs: []                      # e.g. ["10.0.0.0/8","51.83.0.0/16"]
+
+    # --- Storage / system -----------------------------------------------------
+    hf_cache_dir: "/data/hf-cache"            # HF weights cache (NVMe preferred)
+    install_nvidia_driver: false               # set true if nvidia-smi is missing
+    nvidia_driver_package: "cuda-drivers"
+    prefetch_model: true                       # pre-download weights before starting the service
+    service_start_timeout: 2400
+
+    # --- Extra free-form flags ------------------------------------------------
+    tensor_parallel_size: 0                    # 0 = not passed; >0 adds --tensor-parallel-size N
+    extra_vllm_args: ""
+
+  handlers:
+    - name: reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: restart vllm
+      ansible.builtin.systemd:
+        name: gemma-vllm
+        state: restarted
+
+  tasks:
+    # =========================================================================
+    #  0. PREFLIGHT CHECKS
+    # =========================================================================
+    - name: "Preflight — supported OS"
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['distribution'] == 'Ubuntu'
+          - ansible_facts['distribution_major_version'] in ['22', '24', '26']
+        fail_msg: "This playbook targets Ubuntu 22.04/24.04/26.04."
+
+    - name: "Preflight — required secrets set"
+      ansible.builtin.assert:
+        that:
+          - vllm_api_key != 'CHANGE_ME_api_key'
+        fail_msg: "Set vllm_api_key in vars.yml (or Ansible Vault)."
+
+    # =========================================================================
+    #  1. BASE PACKAGES + SYSTEM TUNING
+    # =========================================================================
+    - name: "Base — install prerequisite packages"
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - python3-requests   # required by the uri module (healthcheck)
+          - tuned              # performance profiles
+        state: present
+        update_cache: true
+
+    - name: "Tuning — apply throughput-performance tuned profile"
+      ansible.builtin.command: tuned-adm profile throughput-performance
+      register: tuned_set
+      changed_when: "'already active' not in (tuned_set.stderr | default(''))"
+      failed_when: false
+
+    # =========================================================================
+    #  2. NVIDIA DRIVER (optional) + PERSISTENCE
+    # =========================================================================
+    - name: "GPU — check nvidia-smi"
+      ansible.builtin.command: nvidia-smi -L
+      register: nvsmi
+      changed_when: false
+      failed_when: false
+
+    - name: "GPU — driver missing: action required"
+      ansible.builtin.assert:
+        that: nvsmi.rc == 0 or (install_nvidia_driver | bool)
+        fail_msg: >-
+          nvidia-smi not found — NVIDIA driver absent or not loaded.
+          Options: (1) install the driver manually then reboot,
+          (2) set install_nvidia_driver: true in vars.
+
+    - name: "GPU — install NVIDIA driver (if requested and missing)"
+      when: install_nvidia_driver | bool and nvsmi.rc != 0
+      block:
+        - name: "GPU — add CUDA repository key and repo"
+          ansible.builtin.shell: |
+            set -e
+            distro="ubuntu$(echo {{ ansible_facts['distribution_version'] }} | tr -d '.')"
+            curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/${distro}/x86_64/cuda-keyring_1.1-1_all.deb -o /tmp/cuda-keyring.deb
+            dpkg -i /tmp/cuda-keyring.deb
+          args:
+            creates: /usr/share/keyrings/cuda-archive-keyring.gpg
+
+        - name: "GPU — install {{ nvidia_driver_package }}"
+          ansible.builtin.apt:
+            name: "{{ nvidia_driver_package }}"
+            state: present
+            update_cache: true
+
+        - name: "GPU — reboot required after driver installation"
+          ansible.builtin.fail:
+            msg: "Driver installed. Reboot the server then re-run this playbook."
+
+    - name: "GPU — verify GPU list (fails if no driver)"
+      ansible.builtin.command: nvidia-smi -L
+      register: gpu_list
+      changed_when: false
+      when: nvsmi.rc == 0
+
+    - name: "GPU — enable persistence mode"
+      ansible.builtin.systemd:
+        name: nvidia-persistenced
+        enabled: true
+        state: started
+      failed_when: false
+
+    - name: "GPU — count detected GPUs"
+      ansible.builtin.shell: "nvidia-smi -L | wc -l"
+      register: gpu_count_raw
+      changed_when: false
+
+    - name: "GPU — summary"
+      ansible.builtin.debug:
+        msg: "{{ gpu_count_raw.stdout | trim }} GPU(s) detected — tensor-parallel-size: {{ tensor_parallel_size if (tensor_parallel_size | int) > 0 else 'auto (vLLM)' }}"
+
+    # =========================================================================
+    #  3. DOCKER + NVIDIA CONTAINER TOOLKIT
+    # =========================================================================
+    - name: "Docker — add official GPG key"
+      ansible.builtin.shell: |
+        install -m 0755 -d /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        chmod a+r /etc/apt/keyrings/docker.gpg
+      args:
+        creates: /etc/apt/keyrings/docker.gpg
+
+    - name: "Docker — add apt repository"
+      ansible.builtin.apt_repository:
+        repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu {{ ansible_facts['distribution_release'] }} stable"
+        filename: docker
+        state: present
+
+    - name: "Docker — install Engine and CLI"
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+        update_cache: true
+
+    - name: "Docker — enable and start service"
+      ansible.builtin.systemd:
+        name: docker
+        enabled: true
+        state: started
+
+    - name: "NVIDIA Toolkit — add GPG key"
+      ansible.builtin.shell: |
+        curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+      args:
+        creates: /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+
+    - name: "NVIDIA Toolkit — add apt repository"
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://nvidia.github.io/libnvidia-container/stable/deb/$(ARCH) /"
+        filename: nvidia-container-toolkit
+        state: present
+
+    - name: "NVIDIA Toolkit — install"
+      ansible.builtin.apt:
+        name: nvidia-container-toolkit
+        state: present
+        update_cache: true
+
+    - name: "NVIDIA Toolkit — configure Docker runtime"
+      ansible.builtin.command: nvidia-ctk runtime configure --runtime=docker
+      register: nvctk
+      changed_when: "'already' not in (nvctk.stdout | default(''))"
+      notify: []
+
+    - name: "NVIDIA Toolkit — restart Docker"
+      ansible.builtin.systemd:
+        name: docker
+        state: restarted
+
+    - name: "Sanity — run nvidia-smi inside a container (GPU runtime OK?)"
+      ansible.builtin.command: >-
+        docker run --rm --gpus all --entrypoint nvidia-smi {{ vllm_image }} -L
+      register: docker_gpu
+      changed_when: false
+      failed_when: docker_gpu.rc != 0
+
+    # =========================================================================
+    #  4. vLLM CONFIG (env file + cache dir + optional flags assembly)
+    # =========================================================================
+    - name: "Config — create directories"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0750"
+      loop:
+        - /etc/gemma-vllm
+        - "{{ hf_cache_dir }}"
+
+    - name: "Config — write env file (secrets, mode 0600)"
+      ansible.builtin.copy:
+        dest: /etc/gemma-vllm/gemma-vllm.env
+        mode: "0600"
+        content: |
+          HF_TOKEN={{ hf_token }}
+          VLLM_API_KEY={{ vllm_api_key }}
+          HF_HUB_ENABLE_HF_TRANSFER=0
+      no_log: true
+      notify: restart vllm
+
+    - name: "Config — assemble optional vLLM flags"
+      ansible.builtin.set_fact:
+        vllm_optional_args: >-
+          {{
+            ([] +
+             (['--quantization ' ~ vllm_quantization] if vllm_quantization | length > 0 else []) +
+             (['--tensor-parallel-size ' ~ tensor_parallel_size] if (tensor_parallel_size | int) > 0 else []) +
+             (['--disable-log-requests'] if disable_request_logging | bool else []) +
+             ([extra_vllm_args] if extra_vllm_args | length > 0 else [])
+            ) | join(' ')
+          }}
+
+    # =========================================================================
+    #  5. MODEL PRE-DOWNLOAD (optional, avoids a very long first startup)
+    # =========================================================================
+    - name: "Model — pre-download weights from Hugging Face"
+      when: prefetch_model | bool
+      ansible.builtin.command: >-
+        docker run --rm
+        --env-file /etc/gemma-vllm/gemma-vllm.env
+        -v {{ hf_cache_dir }}:/root/.cache/huggingface
+        --entrypoint python3
+        {{ vllm_image }}
+        -c "from huggingface_hub import snapshot_download; snapshot_download('{{ model_repo }}')"
+      register: prefetch
+      changed_when: "'already' not in (prefetch.stdout | default('') | lower)"
+      async: 3600
+      poll: 30
+
+    # =========================================================================
+    #  6. SYSTEMD SERVICE
+    # =========================================================================
+    - name: "Service — write gemma-vllm systemd unit"
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/gemma-vllm.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Qwen3.6 35B A3B FP8 - vLLM OpenAI-compatible server
+          After=docker.service network-online.target
+          Requires=docker.service
+          Wants=network-online.target
+
+          [Service]
+          Restart=always
+          RestartSec=10
+          TimeoutStartSec={{ service_start_timeout }}
+          ExecStartPre=-/usr/bin/docker rm -f nsn-vllm
+          ExecStartPre=-/usr/bin/docker rm -f gemma-vllm
+          ExecStart=/usr/bin/docker run --rm --name gemma-vllm \
+            --gpus all --ipc=host \
+            --env-file /etc/gemma-vllm/gemma-vllm.env \
+            -v {{ hf_cache_dir }}:/root/.cache/huggingface \
+            -p {{ vllm_bind_host }}:{{ vllm_port }}:8000 \
+            {{ vllm_image }} \
+            --model {{ model_repo }} \
+            --served-model-name {{ served_model_name }} \
+            --kv-cache-dtype {{ kv_cache_dtype }} \
+            --gpu-memory-utilization {{ gpu_memory_utilization }} \
+            --max-model-len {{ max_model_len }} \
+            --max-num-seqs {{ max_num_seqs }} \
+            --enable-chunked-prefill \
+            --language-model-only \
+            '--limit-mm-per-prompt={"image": 0}' \
+            --enable-auto-tool-choice \
+            --tool-call-parser {{ tool_call_parser }} \
+            --reasoning-parser {{ reasoning_parser }} \
+            '--default-chat-template-kwargs={"enable_thinking": {{ enable_thinking | lower }}, "thinking_budget": {{ thinking_budget }}}' \
+            --async-scheduling \
+            '--speculative-config={"method": "mtp", "num_speculative_tokens": {{ speculative_num_tokens }}}' \
+            --host 0.0.0.0 --port 8000 \
+            --trust-remote-code \
+            --mamba-cache-dtype {{ mamba_cache_dtype }} \
+            --mamba-ssm-cache-dtype {{ mamba_ssm_cache_dtype }} \
+            --enable-mamba-cache-stochastic-rounding \
+            --enable-prefix-caching \
+            --mamba-cache-mode {{ mamba_cache_mode }} \
+            --gdn-prefill-backend {{ gdn_prefill_backend }} \
+            {{ vllm_optional_args }}
+          ExecStop=/usr/bin/docker stop gemma-vllm
+
+          [Install]
+          WantedBy=multi-user.target
+      notify:
+        - reload systemd
+        - restart vllm
+
+    - name: "Service — enable unit (start is handled by the restart handler)"
+      ansible.builtin.systemd:
+        name: gemma-vllm
+        enabled: true
+
+    - name: "Service — flush handlers to apply any pending changes"
+      ansible.builtin.meta: flush_handlers
+
+    - name: "Service — start if not already running"
+      ansible.builtin.systemd:
+        name: gemma-vllm
+        state: started
+
+    # =========================================================================
+    #  7. FIREWALL (ufw)
+    # =========================================================================
+    - name: "Firewall — configure ufw (no external collection required)"
+      when: manage_firewall | bool
+      block:
+        - name: "Firewall — install ufw"
+          ansible.builtin.apt:
+            name: ufw
+            state: present
+
+        - name: "Firewall — allow SSH (first, to avoid lockout)"
+          ansible.builtin.command: "ufw allow {{ ssh_port }}/tcp"
+          register: ufw_ssh
+          changed_when: "'added' in (ufw_ssh.stdout | default('')) or 'updated' in (ufw_ssh.stdout | default(''))"
+
+        - name: "Firewall — allow vLLM API from trusted CIDRs"
+          ansible.builtin.command: "ufw allow from {{ item }} to any port {{ vllm_port }} proto tcp"
+          loop: "{{ api_allowed_cidrs }}"
+          when: api_allowed_cidrs | length > 0
+          register: ufw_api
+          changed_when: "'added' in (ufw_api.stdout | default('')) or 'updated' in (ufw_api.stdout | default(''))"
+
+        - name: "Firewall — default policy: deny incoming"
+          ansible.builtin.command: ufw --force default deny incoming
+          changed_when: false
+
+        - name: "Firewall — enable ufw"
+          ansible.builtin.command: ufw --force enable
+          register: ufw_enable
+          changed_when: "'active' in (ufw_enable.stdout | default(''))"
+
+    # =========================================================================
+    #  8. HEALTHCHECK
+    # =========================================================================
+    - name: "Healthcheck — wait for /health (model loading)"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ vllm_port }}/health"
+        status_code: 200
+      register: health
+      until: health.status == 200
+      retries: 60
+      delay: 20
+
+    - name: "Healthcheck — list served models"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ vllm_port }}/v1/models"
+        headers:
+          Authorization: "Bearer {{ vllm_api_key }}"
+        return_content: true
+      register: models
+      no_log: true
+
+    - name: "✅ Endpoint up"
+      ansible.builtin.debug:
+        msg:
+          - "Qwen3.6 35B A3B serving at http://{{ vllm_bind_host }}:{{ vllm_port }}/v1"
+          - "Model name: {{ served_model_name }}"
+          - "max-model-len={{ max_model_len }} | kv-cache={{ kv_cache_dtype }} | max-num-seqs={{ max_num_seqs }} | MTP speculative tokens={{ speculative_num_tokens }}"
+          - "Test: curl -H 'Authorization: Bearer <key>' http://127.0.0.1:{{ vllm_port }}/v1/models"

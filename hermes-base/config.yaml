@@ -1,0 +1,55 @@
+_config_version: 28
+
+model:
+  default: "${MODEL_NAME}"
+  provider: "custom"
+  base_url: "${MODEL_BASE_URL}"
+  api_key: "${MODEL_API_KEY}"
+  context_length: ${CONTEXT_LENGTH}
+  max_tokens: ${MAX_TOKENS}
+
+compression:
+  enabled: true
+  threshold: 0.80
+  target_ratio: 0.30
+
+context:
+  engine: compressor
+  file_read_max_chars: 30000
+  tool_output:
+    max_bytes: 30000
+    max_lines: 500
+
+auxiliary:
+  compression:
+    provider: main
+
+memory:
+  provider: holographic
+
+agent:
+  tool_use_enforcement: true
+  max_turns: 30
+
+display:
+  show_reasoning: false
+  platforms:
+    slack:
+      busy_ack_detail: true
+
+# Slack-specific settings
+slack:
+  require_mention: true
+
+toolsets:
+  - hermes-cli
+  - kanban
+  - todo
+  - search
+  - memory
+
+terminal:
+  backend: "local"
+  cwd: "/workspace"
+  timeout: 180
+  lifetime_seconds: 300
